@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.fluxcapacitated.wallpaper-intros",
+  "name": "Wallpaper Intros",
+  "version": "1.1.0",
+  "author": "fluxCapacitated",
+  "license": "MIT",
+  "description": "Create and play short intro clips when you change Omarchy wallpapers.",
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,91 @@
+#!/bin/bash
+# omarchy-plugin: io.github.fluxcapacitated.wallpaper-intros
+#
+# User PATH wrapper around the stock omarchy-theme-bg-set. When a still
+# wallpaper is chosen and a matching intro clip exists, pre-warm OWE, set the
+# wallpaper, then play the intro. The still remains if playback fails.
+# Respects `omarchy theme bg intro` (background-intros-off) and Hyprland
+# animations off.
+#
+# OWE's renderer can miss the daemon's short startup wait, especially on
+# power-saver profiles, so this wrapper warms the renderer first and retries
+# once if playback fails. Log: ~/.cache/bg-intro.log
+
+set -u
+
+STOCK="/usr/share/omarchy/bin/omarchy-theme-bg-set"
+LOG="$HOME/.cache/bg-intro.log"
+VIDEO_EXTENSIONS=(mp4 m4v mov webm mkv avi)
+
+resolve_overlay_intro() {
+  local background="$1"
+  local theme stem intro source
+
+  theme=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null) || return 1
+  [[ -n $theme && $theme != .* && $theme != */* ]] || return 1
+
+  case $background in
+  "$HOME/.local/state/omarchy/current/theme/backgrounds"/*|\
+  "$HOME/.config/omarchy/themes/$theme/backgrounds"/*|\
+  "$HOME/.config/omarchy/backgrounds/$theme"/*|\
+  /usr/share/omarchy/themes/"$theme"/backgrounds/*) ;;
+  *) return 1 ;;
+  esac
+
+  stem=${background##*/}
+  stem=${stem%.*}
+  for source in \
+    "$HOME/.config/omarchy/themes/$theme/backgrounds/intros" \
+    "$HOME/.config/omarchy/backgrounds/$theme/intros" \
+    "$HOME/.local/state/omarchy/current/theme/backgrounds/intros"
+  do
+    for ext in "${VIDEO_EXTENSIONS[@]}"; do
+      intro="$source/$stem.$ext"
+      if [[ -f $intro ]]; then
+        printf '%s\n' "$intro"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+intro=""
+if [[ -n ${1:-} && -f $1 && ! -f $HOME/.local/state/omarchy/toggles/background-intros-off ]] &&
+   [[ $(hyprctl -j getoption animations:enabled 2>/dev/null | jq -r '.bool' 2>/dev/null) != "false" ]]; then
+  intro=$(/usr/share/omarchy/bin/omarchy-theme-bg-boot-intro --resolve-only "$1" 2>/dev/null || true)
+  if [[ -z $intro ]]; then
+    intro=$(resolve_overlay_intro "$(readlink -f "$1" 2>/dev/null || printf '%s\n' "$1")" || true)
+  fi
+fi
+
+if [[ -n $intro ]] && timeout 2 owe warm >/dev/null 2>&1; then
+  for _ in $(seq 15); do
+    pgrep -x owe-render >/dev/null && break
+    sleep 0.2
+  done
+  # Let the renderer finish loading libmpv before the wallpaper switch.
+  sleep 1.6
+fi
+
+"$STOCK" "$@" || exit $?
+[[ -n $intro ]] || exit 0
+
+mkdir -p "$(dirname "$LOG")"
+setsid -f bash -c '
+  echo "$(date +%T) intro $1"
+  if timeout 60 owe intro --start first-frame "$1"; then
+    echo "$(date +%T) played"
+    exit 0
+  fi
+  sleep 2
+  timeout 2 owe warm >/dev/null 2>&1 || true
+  sleep 0.8
+  if timeout 60 owe intro --start first-frame "$1"; then
+    echo "$(date +%T) played on retry"
+    exit 0
+  fi
+  echo "$(date +%T) failed, still wallpaper only"
+' _ "$intro" </dev/null >>"$LOG" 2>&1
+
+exit 0

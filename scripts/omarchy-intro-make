@@ -1,0 +1,441 @@
+#!/bin/bash
+# omarchy-plugin: io.github.fluxcapacitated.wallpaper-intros
+#
+# Build a short wallpaper intro clip with ffmpeg only. No cloud or AI APIs.
+# The clip keeps the wallpaper's aspect ratio, settles early, and ends on a
+# final frame that matches the still.
+
+set -euo pipefail
+
+PLUGIN_ID="io.github.fluxcapacitated.wallpaper-intros"
+DURATION=4
+FPS=30
+SETTLE_START=2.8
+SETTLE_END=3.3
+CRF=18
+PRESET=medium
+MAX_DIMENSION=2560
+
+STYLE="fade"
+THEME=""
+FORCE=0
+ALL_MISSING=0
+DRY_RUN=0
+OUTPUT=""
+OUTPUT_DIR=""
+WALLPAPER=""
+NO_STATE_COPY=0
+
+STYLES="fade zoom-out blur-sharp bloom"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-intro-make <wallpaper> [--style STYLE] [--theme NAME] [--force]
+      [--output PATH] [--max-dimension N] [--native] [--no-state-copy]
+  omarchy-intro-make --all-missing [--style STYLE] [--theme NAME] [--force]
+      [--output-dir DIR] [--max-dimension N] [--native] [--dry-run]
+
+Build a ~4 second mp4 intro from a wallpaper still, using ffmpeg only.
+
+Styles:
+  fade        Fade in from black, then hold the wallpaper (default)
+  zoom-out    Slow Ken Burns zoom-out that settles on the still
+  blur-sharp  Blurred still that sharpens into the wallpaper
+  bloom       Soft color-bloom reveal into the wallpaper
+
+The clip keeps the wallpaper's true aspect ratio (no stretching), settles
+onto the still before the end, and finishes on a frame that matches it.
+The long edge is limited to 2560 pixels by default, matching typical
+Omarchy intro clips. Use --native for the wallpaper's full pixel size,
+or --max-dimension N to choose another cap. Odd sides are cropped by one
+pixel so the video can use yuv420p.
+
+Output is written to:
+  ~/.config/omarchy/themes/<theme>/backgrounds/intros/<stem>.mp4
+
+An existing clip is never overwritten unless --force is given. If the
+target theme is the one currently active, the clip is also copied into
+~/.local/state/omarchy/current/theme/backgrounds/intros/ so stock login
+and theme-switch playback can find it. --output / --output-dir skip that
+copy and write only to the path you give (useful for tests).
+
+--all-missing makes a clip for every still in the theme that does not
+already have one. The default Omarchy logo (omarchy.webp / .png / .jpg)
+is skipped.
+
+EOF
+}
+
+die() {
+  echo "omarchy-intro-make: $*" >&2
+  exit 1
+}
+
+normalize_style() {
+  case ${1,,} in
+    fade|fade-in|fadein|black) echo fade ;;
+    zoom-out|zoomout|zoom|ken-burns|kenburns|ken) echo zoom-out ;;
+    blur-sharp|blursharp|blur|blur-to-sharp) echo blur-sharp ;;
+    bloom|color-bloom|colour-bloom|colorbloom) echo bloom ;;
+    *) return 1 ;;
+  esac
+}
+
+current_theme() {
+  cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null || true
+}
+
+theme_from_path() {
+  local path="$1"
+  case $path in
+    */themes/*/backgrounds/*)
+      path=${path##*/themes/}
+      echo "${path%%/*}"
+      ;;
+    */backgrounds/*/intros/*|*/backgrounds/*/*)
+      path=${path##*/backgrounds/}
+      echo "${path%%/*}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_still() {
+  case ${1,,} in
+    *.jpg|*.jpeg|*.png|*.bmp|*.webp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_logo() {
+  local base
+  base=$(basename "$1")
+  base=${base%.*}
+  [[ ${base,,} == omarchy ]]
+}
+
+even_dim() {
+  echo $(( $1 / 2 * 2 ))
+}
+
+# Smoothstep 0→1 between SETTLE_START and SETTLE_END, in ffmpeg expr syntax.
+settle_p_expr() {
+  printf 'min(max((T-%s)/(%s-%s),0),1)' "$SETTLE_START" "$SETTLE_END" "$SETTLE_START"
+}
+
+settle_s_expr() {
+  local p
+  p=$(settle_p_expr)
+  printf '(%s)*(%s)*(3-2*(%s))' "$p" "$p" "$p"
+}
+
+probe_size() {
+  local file="$1" raw
+  raw=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$file") || return 1
+  raw=${raw//,/ }
+  printf '%s\n' "$raw"
+}
+
+# Fit the wallpaper into MAX_DIMENSION on the long edge, keep aspect ratio,
+# and make both sides even for yuv420p. A max of 0 means native size.
+fit_dims() {
+  local width="$1" height="$2" max="$3"
+  awk -v w="$width" -v h="$height" -v max="$max" 'BEGIN {
+    if (max <= 0 || (w <= max && h <= max)) {
+      sw = int(w / 2) * 2
+      sh = int(h / 2) * 2
+    } else if (w >= h) {
+      sw = int(max / 2) * 2
+      sh = int((h * sw / w) + 0.5)
+      sh = int(sh / 2) * 2
+      if (sh < 2) sh = 2
+    } else {
+      sh = int(max / 2) * 2
+      sw = int((w * sh / h) + 0.5)
+      sw = int(sw / 2) * 2
+      if (sw < 2) sw = 2
+    }
+    printf "%d %d\n", sw, sh
+  }'
+}
+
+clip_exists() {
+  local stem="$1" dir="$2" ext
+  for ext in mp4 m4v mov webm mkv avi; do
+    if [[ -f $dir/$stem.$ext ]]; then
+      printf '%s\n' "$dir/$stem.$ext"
+      return 0
+    fi
+  done
+  return 1
+}
+
+default_out_dir() {
+  local theme="$1"
+  printf '%s\n' "$HOME/.config/omarchy/themes/$theme/backgrounds/intros"
+}
+
+state_out_dir() {
+  printf '%s\n' "$HOME/.local/state/omarchy/current/theme/backgrounds/intros"
+}
+
+build_filter() {
+  local style="$1" width="$2" height="$3"
+  local s zoom_p
+  s=$(settle_s_expr)
+  zoom_p="min(max(t/${SETTLE_START},0),1)"
+
+  case $style in
+    fade)
+      cat <<EOF
+[0:v]scale=${width}:${height}:flags=lanczos,format=gbrp,split=2[base][still];
+[base]fade=t=in:st=0:d=0.7:color=black,format=gbrp[anim];
+[anim][still]blend=all_expr='A*(1-(${s}))+B*(${s})':shortest=1,format=yuv420p[out]
+EOF
+      ;;
+    zoom-out)
+      cat <<EOF
+[0:v]scale=${width}:${height}:flags=lanczos,format=gbrp,split=2[src][still];
+[src]scale=w='2*trunc(${width}*(1.08-0.08*${zoom_p})/2)':h='2*trunc(${height}*(1.08-0.08*${zoom_p})/2)':flags=lanczos:eval=frame,crop=${width}:${height}:(iw-${width})/2:(ih-${height})/2,format=gbrp[anim];
+[anim][still]blend=all_expr='A*(1-(${s}))+B*(${s})':shortest=1,format=yuv420p[out]
+EOF
+      ;;
+    blur-sharp)
+      cat <<EOF
+[0:v]scale=${width}:${height}:flags=lanczos,format=gbrp,split=2[glow][still];
+[glow]gblur=sigma=14:steps=3,format=gbrp[anim];
+[anim][still]blend=all_expr='A*(1-(${s}))+B*(${s})':shortest=1,format=yuv420p[out]
+EOF
+      ;;
+    bloom)
+      cat <<EOF
+[0:v]scale=${width}:${height}:flags=lanczos,format=gbrp,split=2[glow][still];
+[glow]eq=saturation=1.65:brightness=0.06:contrast=1.05,gblur=sigma=16:steps=2,format=gbrp[anim];
+[anim][still]blend=all_expr='A*(1-(${s}))+B*(${s})':shortest=1,format=yuv420p[out]
+EOF
+      ;;
+    *)
+      die "unknown style '$style'"
+      ;;
+  esac
+}
+
+render_clip() {
+  local img="$1" out="$2" style="$3"
+  local dims width height sw sh filter work still
+
+  [[ -f $img ]] || die "wallpaper not found: $img"
+  is_still "$img" || die "not a still wallpaper image: $img"
+  command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || die "ffmpeg and ffprobe are required to build intros"
+
+  dims=$(probe_size "$img") || die "could not read image size: $img"
+  width=${dims%% *}
+  height=${dims##* }
+  [[ -n $width && -n $height && $width -gt 1 && $height -gt 1 ]] || die "invalid image size for $img"
+
+  read -r sw sh <<<"$(fit_dims "$width" "$height" "$MAX_DIMENSION")"
+  [[ -n $sw && -n $sh && $sw -gt 1 && $sh -gt 1 ]] || die "could not compute output size for $img"
+  if [[ $sw -ne $width || $sh -ne $height ]]; then
+    echo "Scaling ${width}x${height} to ${sw}x${sh} (aspect preserved, even dimensions for yuv420p)."
+  fi
+
+  filter=$(build_filter "$style" "$sw" "$sh" | tr '\n' ' ')
+
+  work=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-intro-make.XXXXXX")
+  still="$work/still.png"
+  cleanup_work() { rm -rf "$work"; }
+  trap cleanup_work RETURN
+  trap cleanup_work EXIT
+
+  # Decode and scale the wallpaper once. Looping the original can re-decode a
+  # large still on every frame and makes styles like zoom-out extremely slow.
+  ffmpeg -y -hide_banner -loglevel error     -i "$img" -frames:v 1     -vf "scale=${sw}:${sh}:flags=lanczos,format=gbrp"     "$still"
+
+  mkdir -p "$(dirname "$out")"
+  ffmpeg -y -hide_banner -loglevel error -stats     -loop 1 -framerate "$FPS" -i "$still"     -t "$DURATION"     -filter_complex "$filter" -map '[out]'     -an -c:v libx264 -preset "$PRESET" -crf "$CRF"     -pix_fmt yuv420p -movflags +faststart     -r "$FPS"     "$out"
+
+  cleanup_work
+  trap - RETURN EXIT
+}
+
+maybe_copy_state() {
+  local out="$1" theme="$2" stem="$3"
+  local current dest
+
+  [[ $NO_STATE_COPY -eq 0 ]] || return 0
+  [[ -z $OUTPUT && -z $OUTPUT_DIR ]] || return 0
+  current=$(current_theme)
+  [[ -n $current && $current == "$theme" ]] || return 0
+
+  dest="$(state_out_dir)/$stem.mp4"
+  if [[ -e $dest && $FORCE -eq 0 ]]; then
+    echo "State copy already exists, leaving it: $dest"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp -f "$out" "$dest"
+  echo "Copied to current theme state: $dest"
+}
+
+make_one() {
+  local img="$1"
+  local theme stem out_dir out existing current
+
+  img=$(readlink -f "$img")
+  stem=$(basename "$img")
+  stem=${stem%.*}
+
+  if [[ -n $OUTPUT ]]; then
+    out=$OUTPUT
+  else
+    theme=$THEME
+    if [[ -z $theme ]]; then
+      theme=$(theme_from_path "$img" || true)
+    fi
+    if [[ -z $theme ]]; then
+      theme=$(current_theme)
+    fi
+    [[ -n $theme && $theme != .* && $theme != */* ]] || die "could not determine theme; pass --theme NAME"
+    if [[ -n $OUTPUT_DIR ]]; then
+      out_dir=$OUTPUT_DIR
+    else
+      out_dir=$(default_out_dir "$theme")
+    fi
+    out="$out_dir/$stem.mp4"
+  fi
+
+  if [[ -e $out && $FORCE -eq 0 ]]; then
+    echo "Skipping, already exists (use --force to replace): $out"
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Would write $STYLE intro: $out"
+    return 0
+  fi
+
+  echo "Building $STYLE intro (${DURATION}s) from $img"
+  render_clip "$img" "$out" "$STYLE"
+  echo "Wrote $out"
+
+  if [[ -z $OUTPUT ]]; then
+    maybe_copy_state "$out" "${theme:-}" "$stem"
+  fi
+}
+
+collect_stills() {
+  local theme="$1"
+  local dir file stem
+  local -A seen=()
+  local -a dirs=(
+    "$HOME/.config/omarchy/themes/$theme/backgrounds"
+    "$HOME/.config/omarchy/backgrounds/$theme"
+  )
+  if [[ $(current_theme) == "$theme" ]]; then
+    dirs+=("$HOME/.local/state/omarchy/current/theme/backgrounds")
+  fi
+  dirs+=("/usr/share/omarchy/themes/$theme/backgrounds")
+
+  for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || continue
+    while IFS= read -r -d '' file; do
+      is_still "$file" || continue
+      is_logo "$file" && continue
+      stem=$(basename "$file")
+      stem=${stem%.*}
+      [[ -z ${seen[$stem]+x} ]] || continue
+      seen[$stem]=1
+      printf '%s\n' "$file"
+    done < <(find -L "$dir" -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
+  done
+}
+
+make_all_missing() {
+  local theme="$1"
+  local img stem out_dir existing count=0 skipped=0
+
+  if [[ -n $OUTPUT_DIR ]]; then
+    out_dir=$OUTPUT_DIR
+  else
+    out_dir=$(default_out_dir "$theme")
+  fi
+
+  while IFS= read -r img; do
+    [[ -n $img ]] || continue
+    stem=$(basename "$img")
+    stem=${stem%.*}
+    if [[ $FORCE -eq 0 ]] && existing=$(clip_exists "$stem" "$out_dir"); then
+      echo "Skipping $stem, already has $existing"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    OUTPUT_DIR=$out_dir make_one "$img"
+    count=$((count + 1))
+  done < <(collect_stills "$theme")
+
+  echo "Done. Built $count missing intro(s), skipped $skipped existing."
+}
+
+# --- args ---
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --style)
+      [[ $# -ge 2 ]] || die "--style needs a value"
+      STYLE=$(normalize_style "$2") || die "unknown style '$2' (try: $STYLES)"
+      shift 2
+      ;;
+    --theme)
+      [[ $# -ge 2 ]] || die "--theme needs a value"
+      THEME=$2
+      [[ $THEME != .* && $THEME != */* && -n $THEME ]] || die "invalid theme name '$THEME'"
+      shift 2
+      ;;
+    --force) FORCE=1; shift ;;
+    --all-missing) ALL_MISSING=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --output)
+      [[ $# -ge 2 ]] || die "--output needs a path"
+      OUTPUT=$2
+      shift 2
+      ;;
+    --output-dir)
+      [[ $# -ge 2 ]] || die "--output-dir needs a path"
+      OUTPUT_DIR=$2
+      shift 2
+      ;;
+    --no-state-copy) NO_STATE_COPY=1; shift ;;
+    --max-dimension)
+      [[ $# -ge 2 ]] || die "--max-dimension needs a value"
+      MAX_DIMENSION=$2
+      [[ $MAX_DIMENSION =~ ^[0-9]+$ ]] || die "--max-dimension must be a non-negative integer (0 keeps native size)"
+      shift 2
+      ;;
+    --native) MAX_DIMENSION=0; shift ;;
+    --list-styles) echo "$STYLES"; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1" ;;
+    *)
+      [[ -z $WALLPAPER ]] || die "unexpected argument: $1"
+      WALLPAPER=$1
+      shift
+      ;;
+  esac
+done
+
+if [[ $ALL_MISSING -eq 1 ]]; then
+  [[ -z $WALLPAPER ]] || die "--all-missing does not take a wallpaper path"
+  [[ -z $OUTPUT ]] || die "--all-missing cannot be used with --output (use --output-dir)"
+  if [[ -z $THEME ]]; then
+    THEME=$(current_theme)
+  fi
+  [[ -n $THEME ]] || die "could not determine theme; pass --theme NAME"
+  make_all_missing "$THEME"
+  exit 0
+fi
+
+[[ -n $WALLPAPER ]] || { usage >&2; exit 1; }
+make_one "$WALLPAPER"
